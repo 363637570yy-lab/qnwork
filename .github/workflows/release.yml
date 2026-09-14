@@ -1,0 +1,202 @@
+# Build & publish the Windows desktop installer:
+# - Windows x64 NSIS setup
+# - portable zip (绿色版)
+# Trigger: push tag v* (e.g. v0.1.0) or manual workflow_dispatch.
+#
+# Repo Settings → Actions → General → Workflow permissions:
+# - Read and write (so the job can create/update Releases)
+#
+# Optional secrets (unsigned builds still publish; SmartScreen may warn):
+# - WINDOWS_CERTIFICATE / WINDOWS_CERTIFICATE_PASSWORD  Authenticode .pfx
+# - GROK_UPDATER_PUBLIC_KEY + TAURI_SIGNING_PRIVATE_KEY  in-app updater
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD may be empty
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to rebuild (e.g. v0.1.0). Leave empty to use package version."
+        required: false
+        default: ""
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish-windows:
+    runs-on: windows-latest
+    name: Build Windows-x64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: Windows-x64
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Prepare release notes from CHANGELOG
+        id: changelog
+        shell: bash
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VER="${{ github.ref_name }}"
+          elif [[ -n "${{ github.event.inputs.tag }}" ]]; then
+            VER="${{ github.event.inputs.tag }}"
+          else
+            VER="v$(python3 -c 'import json; print(json.load(open("package.json"))["version"])')"
+          fi
+          python3 scripts/changelog-for-release.py "$VER" | tee release-notes.md
+          {
+            echo "RELEASE_BODY<<QNWORK_EOF"
+            cat release-notes.md
+            echo "QNWORK_EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Detect updater secrets
+        id: updater
+        shell: bash
+        env:
+          GROK_UPDATER_PUBLIC_KEY: ${{ secrets.GROK_UPDATER_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          has_pub=0
+          has_priv=0
+          [[ -n "${GROK_UPDATER_PUBLIC_KEY:-}" ]] && has_pub=1
+          [[ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]] && has_priv=1
+          if [[ $has_pub -eq 1 && $has_priv -eq 1 ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Updater secrets present — enabling in-app auto-update artifacts"
+          elif [[ $has_pub -eq 0 && $has_priv -eq 0 ]]; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Updater secrets missing — building without createUpdaterArtifacts"
+          else
+            echo "::error::Partial updater secrets: GROK_UPDATER_PUBLIC_KEY=${has_pub} TAURI_SIGNING_PRIVATE_KEY=${has_priv}. Set both or neither."
+            exit 1
+          fi
+
+      - name: Write release config (updater)
+        if: steps.updater.outputs.enabled == 'true'
+        shell: bash
+        env:
+          GROK_UPDATER_PUBLIC_KEY: ${{ secrets.GROK_UPDATER_PUBLIC_KEY }}
+          GROK_UPDATER_ENDPOINT: https://github.com/${{ github.repository }}/releases/download/qnwork-desktop-latest/latest.json
+        run: node scripts/build-release-config.mjs
+
+      - name: Import Windows code signing certificate
+        id: win_sign
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrEmpty($env:WINDOWS_CERTIFICATE)) {
+            Write-Host "WINDOWS_CERTIFICATE not set — Windows build will be unsigned"
+            "enabled=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            return
+          }
+          if ([string]::IsNullOrEmpty($env:WINDOWS_CERTIFICATE_PASSWORD)) {
+            Write-Error "WINDOWS_CERTIFICATE set but WINDOWS_CERTIFICATE_PASSWORD is empty"
+            exit 1
+          }
+          New-Item -ItemType Directory -Force -Path certificate | Out-Null
+          $bytes = [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
+          [IO.File]::WriteAllBytes("$pwd/certificate/certificate.pfx", $bytes)
+          $secure = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -Force -AsPlainText
+          $imported = @(Import-PfxCertificate -FilePath "$pwd/certificate/certificate.pfx" `
+            -CertStoreLocation Cert:\CurrentUser\My -Password $secure)
+          $withKey = @($imported | Where-Object { $_.HasPrivateKey })
+          $code = @($withKey | Where-Object {
+            -not $_.EnhancedKeyUsageList -or
+            ($_.EnhancedKeyUsageList | ForEach-Object { $_.FriendlyName }) -contains 'Code Signing'
+          }) | Select-Object -First 1
+          if (-not $code) { $code = $withKey | Select-Object -First 1 }
+          if (-not $code) {
+            Write-Error "No certificate with private key found in WINDOWS_CERTIFICATE PFX"
+            exit 1
+          }
+          $thumb = [string]$code.Thumbprint
+          if ($thumb -notmatch '^[0-9A-Fa-f]{40}$') {
+            Write-Error "Unexpected certificate thumbprint format: $thumb"
+            exit 1
+          }
+          Write-Host "Imported Windows code signing cert thumbprint=$thumb"
+          $cfg = @{
+            bundle = @{
+              windows = @{
+                certificateThumbprint = $thumb
+                digestAlgorithm = "sha256"
+                timestampUrl = "http://timestamp.digicert.com"
+              }
+            }
+          } | ConvertTo-Json -Depth 6
+          Set-Content -Path "src-tauri/tauri.windows.sign.conf.json" -Value $cfg -Encoding utf8
+          Remove-Item -Recurse -Force certificate -ErrorAction SilentlyContinue
+          "enabled=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Build Tauri app & attach to GitHub Release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GROK_UPDATER_PUBLIC_KEY: ${{ secrets.GROK_UPDATER_PUBLIC_KEY }}
+          GROK_UPDATER_ENDPOINT: https://github.com/${{ github.repository }}/releases/download/qnwork-desktop-latest/latest.json
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: .
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || (github.event.inputs.tag != '' && github.event.inputs.tag || 'v__VERSION__') }}
+          releaseName: "QNwork v__VERSION__"
+          releaseBody: ${{ env.RELEASE_BODY }}
+          releaseDraft: false
+          prerelease: false
+          args: >-
+            --bundles nsis
+            ${{ steps.updater.outputs.enabled == 'true' && ' --config src-tauri/tauri.release.conf.json' || '' }}
+            ${{ steps.win_sign.outputs.enabled == 'true' && ' --config src-tauri/tauri.windows.sign.conf.json' || '' }}
+          includeUpdaterJson: false
+
+      - name: Windows portable zip
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            TAG="${{ github.ref_name }}"
+          elif [[ -n "${{ github.event.inputs.tag }}" ]]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="v$(python3 -c 'import json; print(json.load(open("package.json"))["version"])')"
+          fi
+          bash scripts/package-windows-portable.sh "$TAG"
